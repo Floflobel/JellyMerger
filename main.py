@@ -75,7 +75,9 @@ class JellyfinManager:
             'Content-Type': 'application/json'
         }
 
-    def _get(self, endpoint, params={}):
+    def _get(self, endpoint, params=None):
+        if params is None:
+            params = {}
         if USER_ID:
             params['UserId'] = USER_ID
         try:
@@ -261,6 +263,11 @@ class ScanState:
             self.current = current
             self.current_series_name = series_name
 
+    def set_active_series(self, active_names: list):
+        """For concurrent scans: set all currently active series names."""
+        with self._lock:
+            self.current_series_name = ", ".join(active_names)
+
     def add_result(self, series_id: str, series_name: str, year, candidates: list):
         with self._lock:
             self.results.append({
@@ -293,7 +300,7 @@ class ScanState:
                 'series_with_duplicates': len(self.results)
             }
             if include_results:
-                d['results'] = self.results
+                d['results'] = list(self.results)
             return d
 
 scan_state = ScanState()
@@ -371,12 +378,13 @@ schedule_state = ScheduleState()
 # ==========================================
 
 def run_full_scan(config: ScanConfig, scheduled: bool = False, auto_merge: bool = False):
-    """Run a full library scan in the current thread."""
-    if scan_state.status == "running":
-        return
+    """Run a full library scan in the current thread.
 
+    Expects scan_state to already be set to 'running' by the caller.
+    """
     all_series = manager.get_all_series()
-    scan_state.reset(total=len(all_series), config=config)
+    with scan_state._lock:
+        scan_state.total = len(all_series)
 
     try:
         if config.max_concurrent <= 1:
@@ -404,23 +412,42 @@ def run_full_scan(config: ScanConfig, scheduled: bool = False, auto_merge: bool 
                 if config.delay_seconds > 0 and i < len(all_series) - 1:
                     time.sleep(config.delay_seconds)
         else:
-            # Concurrent scan
+            # Concurrent scan with batching
+            completed_count = 0
+            active_names = []
+            active_lock = threading.Lock()
+
+            def _scan_one(series):
+                name = series.get('Name', 'Unknown')
+                with active_lock:
+                    active_names.append(name)
+                    scan_state.set_active_series(list(active_names))
+                try:
+                    return analyze_series_duplicates(series['Id'])
+                finally:
+                    with active_lock:
+                        if name in active_names:
+                            active_names.remove(name)
+
             with ThreadPoolExecutor(max_workers=config.max_concurrent) as executor:
                 futures = {}
-                for i, series in enumerate(all_series):
+                for series in all_series:
                     if scan_state.is_cancelled():
                         break
-                    future = executor.submit(analyze_series_duplicates, series['Id'])
-                    futures[future] = (i, series)
+                    future = executor.submit(_scan_one, series)
+                    futures[future] = series
 
                 for future in as_completed(futures):
                     if scan_state.is_cancelled():
                         scan_state.complete(status="cancelled")
                         return
 
-                    idx, series = futures[future]
+                    series = futures[future]
                     name = series.get('Name', 'Unknown')
-                    scan_state.update_progress(idx + 1, name)
+                    completed_count += 1
+
+                    with active_lock:
+                        scan_state.update_progress(completed_count, ", ".join(active_names) if active_names else name)
 
                     try:
                         result = future.result()
@@ -453,6 +480,9 @@ def run_full_scan(config: ScanConfig, scheduled: bool = False, auto_merge: bool 
         scan_state.complete(status="error", error=str(e))
 
 def start_scan_thread(config: ScanConfig, scheduled: bool = False, auto_merge: bool = False):
+    # Ensure running state is set before thread starts (for scheduled scans)
+    if scan_state.status != "running":
+        scan_state.reset(total=0, config=config)
     t = threading.Thread(target=run_full_scan, args=(config,), kwargs={'scheduled': scheduled, 'auto_merge': auto_merge}, daemon=True)
     t.start()
 
@@ -495,6 +525,8 @@ def run_merge(request: MergeRequest):
 def scan_start(config: ScanConfig = ScanConfig()):
     if scan_state.status == "running":
         raise HTTPException(status_code=409, detail="A scan is already running")
+    # Set running state immediately so /api/scan/status reflects it before thread starts
+    scan_state.reset(total=0, config=config)
     start_scan_thread(config)
     return {'status': 'started'}
 
@@ -503,7 +535,6 @@ def scan_progress():
     def event_stream():
         while True:
             data = scan_state.to_dict(include_results=False)
-            yield f"data: {json.dumps(data)}\n\n"
 
             if data['status'] in ("completed", "error", "cancelled"):
                 # Send final event with full results
@@ -511,6 +542,7 @@ def scan_progress():
                 yield f"data: {json.dumps(full)}\n\n"
                 break
 
+            yield f"data: {json.dumps(data)}\n\n"
             time.sleep(1)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
