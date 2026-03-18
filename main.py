@@ -393,12 +393,16 @@ def run_full_scan(config: ScanConfig, scheduled: bool = False, auto_merge: bool 
     Expects scan_state to already be set to 'running' by the caller.
     """
     all_series_raw = manager.get_all_series()
-    # Deduplicate series by ID (same series can appear in multiple libraries)
+    # Deduplicate series by ID and by (Name, Year) — same series can appear
+    # in multiple libraries with different IDs
     seen_ids = set()
+    seen_names = set()
     all_series = []
     for s in all_series_raw:
-        if s['Id'] not in seen_ids:
+        key = (s.get('Name', ''), s.get('ProductionYear'))
+        if s['Id'] not in seen_ids and key not in seen_names:
             seen_ids.add(s['Id'])
+            seen_names.add(key)
             all_series.append(s)
     with scan_state._lock:
         scan_state.total = len(all_series)
