@@ -193,12 +193,24 @@ def analyze_series_duplicates(series_id: str) -> dict:
         # --------------------------------
 
         # --- Skip groups of distinct episodes mis-indexed under the same key ---
-        # True duplicates are different files for the same episode (same Name or
-        # very similar filenames). If every item has a unique Jellyfin Name, these
-        # are different episodes that Jellyfin incorrectly assigned the same index.
+        # True duplicates share the same episode. Detect mis-indexed groups by
+        # checking both Jellyfin episode names AND numbers extracted from filenames.
         ep_names = set(item.get('Name', '') for item in items)
         if len(ep_names) > 1 and len(ep_names) == len(items):
-            # All items have distinct episode names — not real duplicates
+            continue
+
+        # Also check: if filenames contain different episode numbers, these are
+        # distinct episodes that Jellyfin grouped under the same index.
+        file_numbers = set()
+        for item in items:
+            path = item.get('Path', '')
+            fname = path.split('/')[-1].split('\\')[-1]
+            # Match common patterns: " - 29 -", "E03", "e03", " 03 ", "ep03"
+            m = re.search(r'[\s\-._](?:E|e|ep|EP)?(\d{1,4})[\s\-._]', fname)
+            if m:
+                file_numbers.add(m.group(1).lstrip('0') or '0')
+        if len(file_numbers) > 1:
+            # Filenames reference different episode numbers — not real duplicates
             continue
         # -------------------------------------------------------------------
 
