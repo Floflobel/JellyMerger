@@ -4,13 +4,20 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import requests
 import re
+import json
+import time
+import threading
+from datetime import datetime, timezone
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from dotenv import load_dotenv
+from croniter import croniter
 
 # ==========================================
 # CONFIGURATION
@@ -29,6 +36,10 @@ JELLYFIN_URL = JELLYFIN_URL.rstrip('/')
 app = FastAPI(title="JellyMerger")
 templates = Jinja2Templates(directory="templates")
 
+# ==========================================
+# MODELS
+# ==========================================
+
 class FileItem(BaseModel):
     name: str
     quality: str
@@ -41,6 +52,20 @@ class MergeGroup(BaseModel):
 
 class MergeRequest(BaseModel):
     groups: List[MergeGroup]
+
+class ScanConfig(BaseModel):
+    delay_seconds: float = 0.5
+    max_concurrent: int = 1
+
+class ScheduleConfig(BaseModel):
+    enabled: bool = False
+    cron_expression: str = "0 3 * * *"
+    auto_merge: bool = False
+    scan_config: ScanConfig = ScanConfig()
+
+# ==========================================
+# JELLYFIN MANAGER
+# ==========================================
 
 class JellyfinManager:
     def __init__(self):
@@ -71,6 +96,17 @@ class JellyfinManager:
         data = self._get("/Items", params)
         return data.get('Items', [])
 
+    def get_all_series(self):
+        params = {
+            'Recursive': 'true',
+            'IncludeItemTypes': 'Series',
+            'Fields': 'Name,Id,ProductionYear',
+            'SortBy': 'SortName',
+            'SortOrder': 'Ascending'
+        }
+        data = self._get("/Items", params)
+        return data.get('Items', [])
+
     def get_all_episodes_recursive(self, series_id: str):
         params = {
             'Recursive': 'true',
@@ -95,7 +131,9 @@ class JellyfinManager:
 
 manager = JellyfinManager()
 
-# --- Helpers ---
+# ==========================================
+# HELPERS
+# ==========================================
 
 def extract_episode_info(item):
     s = item.get('ParentIndexNumber')
@@ -112,25 +150,11 @@ def normalize_path(path):
     if not path: return ""
     return path.replace('\\', '/').strip()
 
-# ==========================================
-# API ROUTES
-# ==========================================
-
-@app.get("/", response_class=HTMLResponse)
-def read_root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-@app.get("/api/search")
-def search(q: str = ""):
-    if len(q) < 2:
-        return []
-    return manager.search_series(q)
-
-@app.get("/api/analyze/{series_id}")
-def analyze(series_id: str):
+def analyze_series_duplicates(series_id: str) -> dict:
+    """Reusable duplicate-detection logic for a single series."""
     episodes = manager.get_all_episodes_recursive(series_id)
     grouped = defaultdict(list)
-    
+
     for ep in episodes:
         s, e = extract_episode_info(ep)
         if s is not None and e is not None:
@@ -148,7 +172,7 @@ def analyze(series_id: str):
         for item in items:
             if item.get('Path'):
                 detected_paths.add(normalize_path(item['Path']))
-        
+
         already_merged = False
         for item in items:
             sources = item.get('MediaSources', [])
@@ -157,11 +181,11 @@ def analyze(series_id: str):
                 for src in sources:
                     if src.get('Path'):
                         known_paths.add(normalize_path(src['Path']))
-                
+
                 if detected_paths.issubset(known_paths):
                     already_merged = True
                     break
-        
+
         if already_merged:
             continue
         # --------------------------------
@@ -171,9 +195,8 @@ def analyze(series_id: str):
         for item in items:
             path = item.get('Path', 'Inconnu')
             filename = path.split('/')[-1].split('\\')[-1]
-            # simple quality detection
             quality = "4K/HDR" if any(x in filename for x in ["2160", "4K", "HDR", "DV"]) else "1080p" if "1080" in filename else "SD"
-            
+
             files.append({
                 'name': filename,
                 'quality': quality,
@@ -188,24 +211,336 @@ def analyze(series_id: str):
         })
 
     candidates.sort(key=lambda x: x['label'])
-    
+
     return {
         'count': len(candidates),
         'results': candidates
     }
 
+# ==========================================
+# SCAN STATE
+# ==========================================
+
+class ScanState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.status = "idle"        # idle | running | completed | error | cancelled
+        self.current = 0
+        self.total = 0
+        self.current_series_name = ""
+        self.results = []           # list of {series_id, series_name, year, candidates}
+        self.started_at = None
+        self.completed_at = None
+        self.error = None
+        self.config = None
+        self._cancel_requested = False
+
+    def request_cancel(self):
+        with self._lock:
+            self._cancel_requested = True
+
+    def is_cancelled(self):
+        with self._lock:
+            return self._cancel_requested
+
+    def reset(self, total: int, config: ScanConfig):
+        with self._lock:
+            self.status = "running"
+            self.current = 0
+            self.total = total
+            self.current_series_name = ""
+            self.results = []
+            self.started_at = datetime.now(timezone.utc).isoformat()
+            self.completed_at = None
+            self.error = None
+            self.config = config.model_dump()
+            self._cancel_requested = False
+
+    def update_progress(self, current: int, series_name: str):
+        with self._lock:
+            self.current = current
+            self.current_series_name = series_name
+
+    def add_result(self, series_id: str, series_name: str, year, candidates: list):
+        with self._lock:
+            self.results.append({
+                'series_id': series_id,
+                'series_name': series_name,
+                'year': year,
+                'candidates': candidates
+            })
+
+    def complete(self, status: str = "completed", error: str = None):
+        with self._lock:
+            self.status = status
+            self.completed_at = datetime.now(timezone.utc).isoformat()
+            self.error = error
+
+    def to_dict(self, include_results: bool = True) -> dict:
+        with self._lock:
+            d = {
+                'status': self.status,
+                'progress': {
+                    'current': self.current,
+                    'total': self.total,
+                    'current_series_name': self.current_series_name
+                },
+                'started_at': self.started_at,
+                'completed_at': self.completed_at,
+                'error': self.error,
+                'config': self.config,
+                'result_count': sum(len(r['candidates']) for r in self.results),
+                'series_with_duplicates': len(self.results)
+            }
+            if include_results:
+                d['results'] = self.results
+            return d
+
+scan_state = ScanState()
+
+# ==========================================
+# SCHEDULE STATE
+# ==========================================
+
+class ScheduleState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.enabled = False
+        self.cron_expression = "0 3 * * *"
+        self.auto_merge = False
+        self.scan_config = ScanConfig()
+        self.next_run_at = None
+        self._timer = None
+
+    def get_config(self) -> dict:
+        with self._lock:
+            return {
+                'enabled': self.enabled,
+                'cron_expression': self.cron_expression,
+                'auto_merge': self.auto_merge,
+                'scan_config': self.scan_config.model_dump(),
+                'next_run_at': self.next_run_at
+            }
+
+    def update(self, config: ScheduleConfig, run_scan_fn):
+        with self._lock:
+            # Cancel existing timer
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+                self.next_run_at = None
+
+            self.enabled = config.enabled
+            self.cron_expression = config.cron_expression
+            self.auto_merge = config.auto_merge
+            self.scan_config = config.scan_config
+
+            if self.enabled:
+                self._schedule_next_locked(run_scan_fn)
+
+    def _schedule_next_locked(self, run_scan_fn):
+        """Must be called while holding self._lock."""
+        now = datetime.now(timezone.utc)
+        cron = croniter(self.cron_expression, now)
+        next_dt = cron.get_next(datetime)
+        self.next_run_at = next_dt.isoformat()
+        delay = (next_dt - now).total_seconds()
+
+        def _on_fire():
+            run_scan_fn(self.scan_config, scheduled=True, auto_merge=self.auto_merge)
+            with self._lock:
+                if self.enabled:
+                    self._schedule_next_locked(run_scan_fn)
+
+        self._timer = threading.Timer(delay, _on_fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def disable(self):
+        with self._lock:
+            self.enabled = False
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self.next_run_at = None
+
+schedule_state = ScheduleState()
+
+# ==========================================
+# SCAN WORKER
+# ==========================================
+
+def run_full_scan(config: ScanConfig, scheduled: bool = False, auto_merge: bool = False):
+    """Run a full library scan in the current thread."""
+    if scan_state.status == "running":
+        return
+
+    all_series = manager.get_all_series()
+    scan_state.reset(total=len(all_series), config=config)
+
+    try:
+        if config.max_concurrent <= 1:
+            # Sequential scan
+            for i, series in enumerate(all_series):
+                if scan_state.is_cancelled():
+                    scan_state.complete(status="cancelled")
+                    return
+
+                name = series.get('Name', 'Unknown')
+                scan_state.update_progress(i + 1, name)
+
+                try:
+                    result = analyze_series_duplicates(series['Id'])
+                    if result['count'] > 0:
+                        scan_state.add_result(
+                            series_id=series['Id'],
+                            series_name=name,
+                            year=series.get('ProductionYear'),
+                            candidates=result['results']
+                        )
+                except Exception as e:
+                    print(f"Error scanning series {name}: {e}")
+
+                if config.delay_seconds > 0 and i < len(all_series) - 1:
+                    time.sleep(config.delay_seconds)
+        else:
+            # Concurrent scan
+            with ThreadPoolExecutor(max_workers=config.max_concurrent) as executor:
+                futures = {}
+                for i, series in enumerate(all_series):
+                    if scan_state.is_cancelled():
+                        break
+                    future = executor.submit(analyze_series_duplicates, series['Id'])
+                    futures[future] = (i, series)
+
+                for future in as_completed(futures):
+                    if scan_state.is_cancelled():
+                        scan_state.complete(status="cancelled")
+                        return
+
+                    idx, series = futures[future]
+                    name = series.get('Name', 'Unknown')
+                    scan_state.update_progress(idx + 1, name)
+
+                    try:
+                        result = future.result()
+                        if result['count'] > 0:
+                            scan_state.add_result(
+                                series_id=series['Id'],
+                                series_name=name,
+                                year=series.get('ProductionYear'),
+                                candidates=result['results']
+                            )
+                    except Exception as e:
+                        print(f"Error scanning series {name}: {e}")
+
+        if scan_state.is_cancelled():
+            scan_state.complete(status="cancelled")
+        else:
+            scan_state.complete(status="completed")
+
+            # Auto-merge if enabled
+            if auto_merge:
+                state_dict = scan_state.to_dict()
+                for series_result in state_dict.get('results', []):
+                    for candidate in series_result.get('candidates', []):
+                        try:
+                            manager.merge_versions(candidate['ids'])
+                        except Exception as e:
+                            print(f"Auto-merge error: {e}")
+
+    except Exception as e:
+        scan_state.complete(status="error", error=str(e))
+
+def start_scan_thread(config: ScanConfig, scheduled: bool = False, auto_merge: bool = False):
+    t = threading.Thread(target=run_full_scan, args=(config,), kwargs={'scheduled': scheduled, 'auto_merge': auto_merge}, daemon=True)
+    t.start()
+
+# ==========================================
+# API ROUTES
+# ==========================================
+
+@app.get("/", response_class=HTMLResponse)
+def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/api/search")
+def search(q: str = ""):
+    if len(q) < 2:
+        return []
+    return manager.search_series(q)
+
+@app.get("/api/analyze/{series_id}")
+def analyze(series_id: str):
+    return analyze_series_duplicates(series_id)
+
 @app.post("/api/merge")
 def run_merge(request: MergeRequest):
     success = 0
     errors = 0
-    
+
     for group in request.groups:
         if manager.merge_versions(group.ids):
             success += 1
         else:
             errors += 1
-            
+
     return {'success': success, 'errors': errors}
+
+# ==========================================
+# SCAN ENDPOINTS
+# ==========================================
+
+@app.post("/api/scan/start")
+def scan_start(config: ScanConfig = ScanConfig()):
+    if scan_state.status == "running":
+        raise HTTPException(status_code=409, detail="A scan is already running")
+    start_scan_thread(config)
+    return {'status': 'started'}
+
+@app.get("/api/scan/progress")
+def scan_progress():
+    def event_stream():
+        while True:
+            data = scan_state.to_dict(include_results=False)
+            yield f"data: {json.dumps(data)}\n\n"
+
+            if data['status'] in ("completed", "error", "cancelled"):
+                # Send final event with full results
+                full = scan_state.to_dict(include_results=True)
+                yield f"data: {json.dumps(full)}\n\n"
+                break
+
+            time.sleep(1)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.get("/api/scan/status")
+def scan_status():
+    return scan_state.to_dict(include_results=True)
+
+@app.post("/api/scan/cancel")
+def scan_cancel():
+    if scan_state.status != "running":
+        raise HTTPException(status_code=400, detail="No scan is currently running")
+    scan_state.request_cancel()
+    return {'status': 'cancel_requested'}
+
+# ==========================================
+# SCHEDULE ENDPOINTS
+# ==========================================
+
+@app.get("/api/schedule")
+def get_schedule():
+    return schedule_state.get_config()
+
+@app.post("/api/schedule")
+def set_schedule(config: ScheduleConfig):
+    if config.enabled:
+        if not croniter.is_valid(config.cron_expression):
+            raise HTTPException(status_code=400, detail="Invalid cron expression")
+    schedule_state.update(config, start_scan_thread)
+    return schedule_state.get_config()
 
 if __name__ == "__main__":
     import uvicorn

@@ -9,6 +9,7 @@ description = "auto merge media for jellyfin"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "croniter>=6.0.0",
     "fastapi>=0.122.0",
     "jinja2>=3.1.6",
     "pydantic>=2.12.5",
