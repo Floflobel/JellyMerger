@@ -192,6 +192,16 @@ def analyze_series_duplicates(series_id: str) -> dict:
             continue
         # --------------------------------
 
+        # --- Skip groups of distinct episodes mis-indexed under the same key ---
+        # True duplicates are different files for the same episode (same Name or
+        # very similar filenames). If every item has a unique Jellyfin Name, these
+        # are different episodes that Jellyfin incorrectly assigned the same index.
+        ep_names = set(item.get('Name', '') for item in items)
+        if len(ep_names) > 1 and len(ep_names) == len(items):
+            # All items have distinct episode names — not real duplicates
+            continue
+        # -------------------------------------------------------------------
+
         files = []
         ids = []
         for item in items:
@@ -382,7 +392,14 @@ def run_full_scan(config: ScanConfig, scheduled: bool = False, auto_merge: bool 
 
     Expects scan_state to already be set to 'running' by the caller.
     """
-    all_series = manager.get_all_series()
+    all_series_raw = manager.get_all_series()
+    # Deduplicate series by ID (same series can appear in multiple libraries)
+    seen_ids = set()
+    all_series = []
+    for s in all_series_raw:
+        if s['Id'] not in seen_ids:
+            seen_ids.add(s['Id'])
+            all_series.append(s)
     with scan_state._lock:
         scan_state.total = len(all_series)
 
