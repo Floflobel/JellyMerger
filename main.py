@@ -177,8 +177,8 @@ class JellyfinManager:
     def get_all_episodes_recursive(
         self, series_id: str, date_modified: Optional[str] = None
     ):
-        # Use series_id only if date_modified is None (Jellyfin often doesn't provide it)
-        cache_key = series_id if date_modified is None else (series_id, date_modified)
+        # Always use series_id only for cache (DateModified changes every scan)
+        cache_key = series_id
         with self._cache_lock:
             if cache_key in self._episode_cache:
                 self._cache_hits += 1
@@ -376,6 +376,8 @@ class ScanState:
         self.cache_misses = 0
         self.api_calls = 0
         self.total_scan_time = 0.0
+        self.current_series_date_modified: Optional[str] = None
+        self.active_series_list: list = []
 
     def request_cancel(self):
         with self._lock:
@@ -401,16 +403,27 @@ class ScanState:
             self.cache_misses = 0
             self.api_calls = 0
             self.total_scan_time = 0.0
+            self.current_series_date_modified = None
+            self.active_series_list = []
 
-    def update_progress(self, current: int, series_name: str):
+    def update_progress(
+        self, current: int, series_name: str, date_modified: Optional[str] = None
+    ):
         with self._lock:
             self.current = current
             self.current_series_name = series_name
+            self.current_series_date_modified = date_modified
 
-    def set_active_series(self, active_names: list):
-        """For concurrent scans: set all currently active series names."""
+    def set_active_series(self, active_series: list):
+        """For concurrent scans: set all currently active series with their dates.
+
+        Args:
+            active_series: List of dicts with 'name' and 'date_modified' keys
+        """
         with self._lock:
-            self.current_series_name = ", ".join(active_names)
+            self.active_series_list = active_series
+            names = [s["name"] for s in active_series]
+            self.current_series_name = ", ".join(names) if names else ""
 
     def add_result(self, series_id: str, series_name: str, year, candidates: list):
         with self._lock:
@@ -437,6 +450,7 @@ class ScanState:
                     "current": self.current,
                     "total": self.total,
                     "current_series_name": self.current_series_name,
+                    "current_series_date_modified": self.current_series_date_modified,
                 },
                 "started_at": self.started_at,
                 "completed_at": self.completed_at,
@@ -563,7 +577,7 @@ def run_full_scan(
                     return
 
                 name = series.get("Name", "Unknown")
-                scan_state.update_progress(i + 1, name)
+                scan_state.update_progress(i + 1, name, series.get("DateModified"))
 
                 try:
                     result = analyze_series_duplicates(
@@ -585,21 +599,25 @@ def run_full_scan(
             # Concurrent scan with batching
             completed_count = 0
             active_names = []
+            active_series = []
             active_lock = threading.Lock()
 
             def _scan_one(series):
                 name = series.get("Name", "Unknown")
+                date_modified = series.get("DateModified")
+                active_entry = {"name": name, "date_modified": date_modified}
                 with active_lock:
                     active_names.append(name)
-                    scan_state.set_active_series(list(active_names))
+                    active_series.append(active_entry)
+                    scan_state.set_active_series(list(active_series))
                 try:
-                    return analyze_series_duplicates(
-                        series["Id"], series.get("DateModified")
-                    )
+                    return analyze_series_duplicates(series["Id"], date_modified)
                 finally:
                     with active_lock:
                         if name in active_names:
                             active_names.remove(name)
+                        if active_entry in active_series:
+                            active_series.remove(active_entry)
 
             with ThreadPoolExecutor(max_workers=config.max_concurrent) as executor:
                 futures = {}

@@ -218,8 +218,9 @@
                                                 </div>
                                                 <ul class="list-group list-group-flush">
                                                     <template x-for="file in group.files">
-                                                        <li class="list-group-item d-flex align-items-center justify-content-between py-1 px-2">
-                                                            <div class="text-truncate me-2">
+                                                        <li class="list-group-item d-flex align-items-center justify-content-between py-1 px-2"
+                                                            :title="file.path">
+                                                            <div class="text-truncate me-2" :title="file.path">
                                                                 <small x-text="file.name"></small>
                                                             </div>
                                                             <span class="badge"
@@ -309,6 +310,7 @@
                     <div class="mb-3 text-center">
                         <span class="text-muted">Currently scanning: </span>
                         <strong x-text="scan.progress.current_series_name || '...'"></strong>
+                        <small class="text-muted ms-2" x-show="scan.progress.current_series_date_modified" x-text="'(modified: ' + formatDateModified(scan.progress.current_series_date_modified) + ')'"></small>
                     </div>
 
                     <div class="text-center mb-3" x-show="scanEta">
@@ -786,6 +788,16 @@
                 if (!iso) return '';
                 try {
                     return new Date(iso).toLocaleString();
+                } catch {
+                    return iso;
+                }
+            },
+
+            formatDateModified(iso) {
+                if (!iso) return '';
+                try {
+                    const d = new Date(iso);
+                    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
                 } catch {
                     return iso;
                 }
