@@ -86,6 +86,8 @@ class JellyfinManager:
                 "Content-Type": "application/json",
             }
         )
+        self._episode_cache = {}
+        self._cache_lock = threading.Lock()
 
     def _get(self, endpoint, params=None):
         if params is None:
@@ -114,14 +116,20 @@ class JellyfinManager:
         params = {
             "Recursive": "true",
             "IncludeItemTypes": "Series",
-            "Fields": "Name,Id,ProductionYear",
+            "Fields": "Name,Id,ProductionYear,DateModified",
             "SortBy": "SortName",
             "SortOrder": "Ascending",
         }
         data = self._get("/Items", params)
         return data.get("Items", [])
 
-    def get_all_episodes_recursive(self, series_id: str):
+    def get_all_episodes_recursive(
+        self, series_id: str, date_modified: Optional[str] = None
+    ):
+        cache_key = (series_id, date_modified)
+        with self._cache_lock:
+            if cache_key in self._episode_cache:
+                return self._episode_cache[cache_key]
         params = {
             "Recursive": "true",
             "ParentId": series_id,
@@ -129,7 +137,14 @@ class JellyfinManager:
             "Fields": "ParentIndexNumber,IndexNumber,Path,Name,MediaSources",
         }
         data = self._get("/Items", params)
-        return data.get("Items", [])
+        episodes = data.get("Items", [])
+        with self._cache_lock:
+            self._episode_cache[cache_key] = episodes
+        return episodes
+
+    def clear_episode_cache(self):
+        with self._cache_lock:
+            self._episode_cache.clear()
 
     def merge_versions(self, ids: List[str]):
         endpoint = f"{JELLYFIN_URL}/Videos/MergeVersions"
@@ -169,9 +184,11 @@ def normalize_path(path):
     return path.replace("\\", "/").strip()
 
 
-def analyze_series_duplicates(series_id: str) -> dict:
+def analyze_series_duplicates(
+    series_id: str, date_modified: Optional[str] = None
+) -> dict:
     """Reusable duplicate-detection logic for a single series."""
-    episodes = manager.get_all_episodes_recursive(series_id)
+    episodes = manager.get_all_episodes_recursive(series_id, date_modified)
     grouped = defaultdict(list)
 
     for ep in episodes:
@@ -426,6 +443,7 @@ def run_full_scan(
 
     Expects scan_state to already be set to 'running' by the caller.
     """
+    manager.clear_episode_cache()
     all_series_raw = manager.get_all_series()
     # Deduplicate series by ID and by (Name, Year) — same series can appear
     # in multiple libraries with different IDs
@@ -453,7 +471,9 @@ def run_full_scan(
                 scan_state.update_progress(i + 1, name)
 
                 try:
-                    result = analyze_series_duplicates(series["Id"])
+                    result = analyze_series_duplicates(
+                        series["Id"], series.get("DateModified")
+                    )
                     if result["count"] > 0:
                         scan_state.add_result(
                             series_id=series["Id"],
@@ -478,7 +498,9 @@ def run_full_scan(
                     active_names.append(name)
                     scan_state.set_active_series(list(active_names))
                 try:
-                    return analyze_series_duplicates(series["Id"])
+                    return analyze_series_duplicates(
+                        series["Id"], series.get("DateModified")
+                    )
                 finally:
                     with active_lock:
                         if name in active_names:
