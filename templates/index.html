@@ -404,7 +404,7 @@
             isMerging: false,
 
             // --- Full scan tab ---
-            scanConfig: { delay_seconds: 0.5, max_concurrent: 1 },
+            scanConfig: { delay_seconds: 0.1, max_concurrent: 5 },
             scan: {
                 status: 'idle',
                 progress: { current: 0, total: 0, current_series_name: '' },
@@ -426,7 +426,7 @@
                 enabled: false,
                 cron_expression: '0 3 * * *',
                 auto_merge: false,
-                scan_config: { delay_seconds: 0.5, max_concurrent: 1 }
+                scan_config: { delay_seconds: 0.1, max_concurrent: 5 }
             },
             schedule: {
                 enabled: false,
