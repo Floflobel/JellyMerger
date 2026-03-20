@@ -636,6 +636,10 @@
                     this.scan.progress = { current: 0, total: 0, current_series_name: '' };
                     this.scan.results = [];
                     this.scan.error = null;
+                    this.scan.cache_hits = 0;
+                    this.scan.cache_misses = 0;
+                    this.scan.api_calls = 0;
+                    this.scan.total_scan_time = 0;
                     this.scanStartTime = Date.now();
                     this.expandedSeries = {};
                     this.connectScanSSE();

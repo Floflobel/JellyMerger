@@ -12,8 +12,9 @@ import re
 import json
 import time
 import threading
+import atexit
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from dotenv import load_dotenv
@@ -86,11 +87,15 @@ class JellyfinManager:
                 "Content-Type": "application/json",
             }
         )
-        self._episode_cache = {}
+        self._episode_cache = OrderedDict()
+        self._max_cache_size = 500
         self._cache_lock = threading.Lock()
         self._cache_hits = 0
         self._cache_misses = 0
         self._api_calls = 0
+
+    def close(self):
+        self.session.close()
 
     def _get(self, endpoint, params=None):
         if params is None:
@@ -172,7 +177,8 @@ class JellyfinManager:
     def get_all_episodes_recursive(
         self, series_id: str, date_modified: Optional[str] = None
     ):
-        cache_key = (series_id, date_modified)
+        # Use series_id only if date_modified is None (Jellyfin often doesn't provide it)
+        cache_key = series_id if date_modified is None else (series_id, date_modified)
         with self._cache_lock:
             if cache_key in self._episode_cache:
                 self._cache_hits += 1
@@ -188,15 +194,18 @@ class JellyfinManager:
         }
         all_episodes = []
         while True:
-            with self._cache_lock:
-                self._api_calls += 1
+            self._api_calls += 1
             data = self._get("/Items", params)
             items = data.get("Items", [])
-            if not items or len(items) < 250:
+            if not items:
                 break
             all_episodes.extend(items)
-            params["StartIndex"] += 250
+            if len(items) < params["Limit"]:
+                break
+            params["StartIndex"] += params["Limit"]
         with self._cache_lock:
+            if len(self._episode_cache) >= self._max_cache_size:
+                self._episode_cache.popitem(last=False)
             self._episode_cache[cache_key] = all_episodes
         return all_episodes
 
@@ -233,6 +242,7 @@ class JellyfinManager:
 
 
 manager = JellyfinManager()
+atexit.register(manager.close)
 
 # ==========================================
 # HELPERS
@@ -391,10 +401,6 @@ class ScanState:
             self.cache_misses = 0
             self.api_calls = 0
             self.total_scan_time = 0.0
-            self.cache_hits = 0
-            self.cache_misses = 0
-            self.api_calls = 0
-            self.total_scan_time = 0.0
 
     def update_progress(self, current: int, series_name: str):
         with self._lock:
@@ -532,7 +538,6 @@ def run_full_scan(
 
     Expects scan_state to already be set to 'running' by the caller.
     """
-    manager.clear_episode_cache()
     all_series_raw = manager.get_all_series()
     start_time = time.time()
     # Deduplicate series by ID and by (Name, Year) — same series can appear
@@ -638,11 +643,12 @@ def run_full_scan(
 
             # Update cache stats from manager
             cache_stats = manager.get_cache_stats()
+            duration = max(0, time.time() - start_time)
             with scan_state._lock:
                 scan_state.cache_hits = cache_stats["hits"]
                 scan_state.cache_misses = cache_stats["misses"]
                 scan_state.api_calls = cache_stats["total_calls"]
-                scan_state.total_scan_time = round(time.time() - start_time, 4)
+                scan_state.total_scan_time = round(duration, 4)
 
             # Auto-merge if enabled
             if auto_merge:
