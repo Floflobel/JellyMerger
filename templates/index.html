@@ -435,7 +435,11 @@
                 completed_at: null,
                 error: null,
                 result_count: 0,
-                series_with_duplicates: 0
+                series_with_duplicates: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                api_calls: 0,
+                avg_response_time: 0
             },
             scanFilter: '',
             scanSort: 'name',
@@ -608,6 +612,10 @@
                 this.scan.error = data.error;
                 this.scan.result_count = data.result_count || 0;
                 this.scan.series_with_duplicates = data.series_with_duplicates || 0;
+                this.scan.cache_hits = data.cache_hits || 0;
+                this.scan.cache_misses = data.cache_misses || 0;
+                this.scan.api_calls = data.api_calls || 0;
+                this.scan.avg_response_time = data.avg_response_time || 0;
                 if (data.results) {
                     this.scan.results = data.results;
                 }
