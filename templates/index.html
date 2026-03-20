@@ -159,8 +159,8 @@
                             <div class="fw-bold" x-text="scan.api_calls || 0"></div>
                         </div>
                         <div class="col-6 col-md-3">
-                            <div class="text-muted small">Avg Response</div>
-                            <div class="fw-bold" x-text="(scan.avg_response_time || 0).toFixed(2) + 's'"></div>
+                            <div class="text-muted small">Scan Duration</div>
+                            <div class="fw-bold" x-text="(scan.total_scan_time || 0).toFixed(2) + 's'"></div>
                         </div>
                     </div>
                 </div>
@@ -439,7 +439,7 @@
                 cache_hits: 0,
                 cache_misses: 0,
                 api_calls: 0,
-                avg_response_time: 0
+                total_scan_time: 0
             },
             scanFilter: '',
             scanSort: 'name',
@@ -615,7 +615,7 @@
                 this.scan.cache_hits = data.cache_hits || 0;
                 this.scan.cache_misses = data.cache_misses || 0;
                 this.scan.api_calls = data.api_calls || 0;
-                this.scan.avg_response_time = data.avg_response_time || 0;
+                this.scan.total_scan_time = data.total_scan_time || 0;
                 if (data.results) {
                     this.scan.results = data.results;
                 }

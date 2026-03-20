@@ -127,7 +127,7 @@ class JellyfinManager:
                     print(f"Connection error after {max_attempts} attempts")
                     return {}
             except requests.exceptions.HTTPError as e:
-                status_code = r.status_code
+                status_code = e.response.status_code
                 if 500 <= status_code < 600:
                     if attempt < max_attempts - 1:
                         print(
@@ -188,10 +188,11 @@ class JellyfinManager:
         }
         all_episodes = []
         while True:
-            self._api_calls += 1
+            with self._cache_lock:
+                self._api_calls += 1
             data = self._get("/Items", params)
             items = data.get("Items", [])
-            if not items:
+            if not items or len(items) < 250:
                 break
             all_episodes.extend(items)
             params["StartIndex"] += 250
@@ -214,6 +215,9 @@ class JellyfinManager:
     def clear_episode_cache(self):
         with self._cache_lock:
             self._episode_cache.clear()
+            self._cache_hits = 0
+            self._cache_misses = 0
+            self._api_calls = 0
 
     def merge_versions(self, ids: List[str]):
         endpoint = f"{JELLYFIN_URL}/Videos/MergeVersions"
@@ -361,7 +365,7 @@ class ScanState:
         self.cache_hits = 0
         self.cache_misses = 0
         self.api_calls = 0
-        self.avg_response_time = 0.0
+        self.total_scan_time = 0.0
 
     def request_cancel(self):
         with self._lock:
@@ -386,7 +390,11 @@ class ScanState:
             self.cache_hits = 0
             self.cache_misses = 0
             self.api_calls = 0
-            self.avg_response_time = 0.0
+            self.total_scan_time = 0.0
+            self.cache_hits = 0
+            self.cache_misses = 0
+            self.api_calls = 0
+            self.total_scan_time = 0.0
 
     def update_progress(self, current: int, series_name: str):
         with self._lock:
@@ -433,7 +441,7 @@ class ScanState:
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
                 "api_calls": self.api_calls,
-                "avg_response_time": self.avg_response_time,
+                "total_scan_time": self.total_scan_time,
             }
             if include_results:
                 d["results"] = list(self.results)
@@ -634,7 +642,7 @@ def run_full_scan(
                 scan_state.cache_hits = cache_stats["hits"]
                 scan_state.cache_misses = cache_stats["misses"]
                 scan_state.api_calls = cache_stats["total_calls"]
-                scan_state.avg_response_time = round(time.time() - start_time, 4)
+                scan_state.total_scan_time = round(time.time() - start_time, 4)
 
             # Auto-merge if enabled
             if auto_merge:
