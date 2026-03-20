@@ -61,8 +61,8 @@ class MergeRequest(BaseModel):
 
 
 class ScanConfig(BaseModel):
-    delay_seconds: float = 0.1
-    max_concurrent: int = 5
+    delay_seconds: float = 0
+    max_concurrent: int = 15
 
 
 class ScheduleConfig(BaseModel):
@@ -451,6 +451,7 @@ class ScanState:
                     "total": self.total,
                     "current_series_name": self.current_series_name,
                     "current_series_date_modified": self.current_series_date_modified,
+                    "active_series": self.active_series_list,
                 },
                 "started_at": self.started_at,
                 "completed_at": self.completed_at,

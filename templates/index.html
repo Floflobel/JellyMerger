@@ -219,8 +219,8 @@
                                                 <ul class="list-group list-group-flush">
                                                     <template x-for="file in group.files">
                                                         <li class="list-group-item d-flex align-items-center justify-content-between py-1 px-2"
-                                                            :title="file.path">
-                                                            <div class="text-truncate me-2" :title="file.path">
+                                                            x-bind:title="file.path">
+                                                            <div class="text-truncate me-2" x-bind:title="file.path">
                                                                 <small x-text="file.name"></small>
                                                             </div>
                                                             <span class="badge"
@@ -307,10 +307,23 @@
                         </div>
                     </div>
 
-                    <div class="mb-3 text-center">
-                        <span class="text-muted">Currently scanning: </span>
-                        <strong x-text="scan.progress.current_series_name || '...'"></strong>
-                        <small class="text-muted ms-2" x-show="scan.progress.current_series_date_modified" x-text="'(modified: ' + formatDateModified(scan.progress.current_series_date_modified) + ')'"></small>
+                    <div class="mb-3">
+                        <span class="text-muted d-block mb-2">Currently scanning:</span>
+                        <!-- Concurrent mode: show list of active series with dates -->
+                        <div x-show="scan.progress.active_series && scan.progress.active_series.length > 0">
+                            <template x-for="(series, index) in scan.progress.active_series" :key="index">
+                                <div class="d-flex justify-content-between align-items-center py-1 px-2" :class="index % 2 === 0 ? 'bg-light' : ''">
+                                    <strong class="text-truncate" style="max-width: 60%;" x-text="series.name" :title="series.name"></strong>
+                                    <small class="text-muted" x-show="series.date_modified" x-text="formatDateModified(series.date_modified)"></small>
+                                    <small class="text-muted" x-show="!series.date_modified">No date</small>
+                                </div>
+                            </template>
+                        </div>
+                        <!-- Sequential mode: show single series with date -->
+                        <div x-show="!scan.progress.active_series || scan.progress.active_series.length === 0">
+                            <strong x-text="scan.progress.current_series_name || '...'"></strong>
+                            <small class="text-muted ms-2" x-show="scan.progress.current_series_date_modified" x-text="'(modified: ' + formatDateModified(scan.progress.current_series_date_modified) + ')'"></small>
+                        </div>
                     </div>
 
                     <div class="text-center mb-3" x-show="scanEta">
@@ -428,7 +441,7 @@
             isMerging: false,
 
             // --- Full scan tab ---
-            scanConfig: { delay_seconds: 0.1, max_concurrent: 5 },
+            scanConfig: { delay_seconds: 0, max_concurrent: 15 },
             scan: {
                 status: 'idle',
                 progress: { current: 0, total: 0, current_series_name: '' },
