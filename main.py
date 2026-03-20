@@ -88,19 +88,65 @@ class JellyfinManager:
         )
         self._episode_cache = {}
         self._cache_lock = threading.Lock()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._api_calls = 0
 
     def _get(self, endpoint, params=None):
         if params is None:
             params = {}
         if USER_ID:
             params["UserId"] = USER_ID
-        try:
-            r = self.session.get(f"{JELLYFIN_URL}{endpoint}", params=params, timeout=30)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            print(f"Error API: {e}")
-            return {}
+
+        max_attempts = 3
+        backoff_delays = [0.5, 1.0, 2.0]
+
+        for attempt in range(max_attempts):
+            try:
+                r = self.session.get(
+                    f"{JELLYFIN_URL}{endpoint}", params=params, timeout=30
+                )
+                r.raise_for_status()
+                return r.json()
+            except requests.exceptions.Timeout:
+                if attempt < max_attempts - 1:
+                    print(
+                        f"Request timed out, retry {attempt + 1}/{max_attempts} in {backoff_delays[attempt]}s"
+                    )
+                    time.sleep(backoff_delays[attempt])
+                else:
+                    print(f"Request timed out after {max_attempts} attempts")
+                    return {}
+            except requests.exceptions.ConnectionError:
+                if attempt < max_attempts - 1:
+                    print(
+                        f"Connection error, retry {attempt + 1}/{max_attempts} in {backoff_delays[attempt]}s"
+                    )
+                    time.sleep(backoff_delays[attempt])
+                else:
+                    print(f"Connection error after {max_attempts} attempts")
+                    return {}
+            except requests.exceptions.HTTPError as e:
+                status_code = r.status_code
+                if 500 <= status_code < 600:
+                    if attempt < max_attempts - 1:
+                        print(
+                            f"Server error {status_code}, retry {attempt + 1}/{max_attempts} in {backoff_delays[attempt]}s"
+                        )
+                        time.sleep(backoff_delays[attempt])
+                    else:
+                        print(
+                            f"Server error {status_code} after {max_attempts} attempts"
+                        )
+                        return {}
+                else:
+                    print(f"Client error {status_code}: {e}")
+                    return {}
+            except Exception as e:
+                print(f"Error API: {e}")
+                return {}
+
+        return {}
 
     def search_series(self, query: str):
         params = {
@@ -129,18 +175,41 @@ class JellyfinManager:
         cache_key = (series_id, date_modified)
         with self._cache_lock:
             if cache_key in self._episode_cache:
+                self._cache_hits += 1
                 return self._episode_cache[cache_key]
+            self._cache_misses += 1
         params = {
             "Recursive": "true",
             "ParentId": series_id,
             "IncludeItemTypes": "Episode",
             "Fields": "ParentIndexNumber,IndexNumber,Path,Name,MediaSources",
+            "Limit": 250,
+            "StartIndex": 0,
         }
-        data = self._get("/Items", params)
-        episodes = data.get("Items", [])
+        all_episodes = []
+        while True:
+            self._api_calls += 1
+            data = self._get("/Items", params)
+            items = data.get("Items", [])
+            if not items:
+                break
+            all_episodes.extend(items)
+            params["StartIndex"] += 250
         with self._cache_lock:
-            self._episode_cache[cache_key] = episodes
-        return episodes
+            self._episode_cache[cache_key] = all_episodes
+        return all_episodes
+
+    def get_cache_stats(self) -> dict:
+        with self._cache_lock:
+            total = self._cache_hits + self._cache_misses
+            hit_rate = self._cache_hits / total if total > 0 else 0.0
+            return {
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "hit_rate": round(hit_rate, 4),
+                "total_calls": total,
+                "cache_size": len(self._episode_cache),
+            }
 
     def clear_episode_cache(self):
         with self._cache_lock:
@@ -289,6 +358,10 @@ class ScanState:
         self.error = None
         self.config = None
         self._cancel_requested = False
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.api_calls = 0
+        self.avg_response_time = 0.0
 
     def request_cancel(self):
         with self._lock:
@@ -310,6 +383,10 @@ class ScanState:
             self.error = None
             self.config = config.model_dump()
             self._cancel_requested = False
+            self.cache_hits = 0
+            self.cache_misses = 0
+            self.api_calls = 0
+            self.avg_response_time = 0.0
 
     def update_progress(self, current: int, series_name: str):
         with self._lock:
@@ -353,6 +430,10 @@ class ScanState:
                 "config": self.config,
                 "result_count": sum(len(r["candidates"]) for r in self.results),
                 "series_with_duplicates": len(self.results),
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "api_calls": self.api_calls,
+                "avg_response_time": self.avg_response_time,
             }
             if include_results:
                 d["results"] = list(self.results)
@@ -445,6 +526,7 @@ def run_full_scan(
     """
     manager.clear_episode_cache()
     all_series_raw = manager.get_all_series()
+    start_time = time.time()
     # Deduplicate series by ID and by (Name, Year) — same series can appear
     # in multiple libraries with different IDs
     seen_ids = set()
@@ -545,6 +627,14 @@ def run_full_scan(
             scan_state.complete(status="cancelled")
         else:
             scan_state.complete(status="completed")
+
+            # Update cache stats from manager
+            cache_stats = manager.get_cache_stats()
+            with scan_state._lock:
+                scan_state.cache_hits = cache_stats["hits"]
+                scan_state.cache_misses = cache_stats["misses"]
+                scan_state.api_calls = cache_stats["total_calls"]
+                scan_state.avg_response_time = round(time.time() - start_time, 4)
 
             # Auto-merge if enabled
             if auto_merge:
@@ -655,6 +745,16 @@ def scan_cancel():
         raise HTTPException(status_code=400, detail="No scan is currently running")
     scan_state.request_cancel()
     return {"status": "cancel_requested"}
+
+
+# ==========================================
+# STATS ENDPOINT
+# ==========================================
+
+
+@app.get("/api/stats")
+def get_stats():
+    return manager.get_cache_stats()
 
 
 # ==========================================

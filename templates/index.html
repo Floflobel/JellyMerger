@@ -143,6 +143,28 @@
                     <button class="btn btn-sm btn-outline-secondary" @click="clearScanResults()">Clear</button>
                 </div>
 
+                <!-- Performance Stats -->
+                <div x-show="scan.cache_hits !== undefined || scan.cache_misses !== undefined" class="alert alert-secondary mb-3">
+                    <div class="row text-center">
+                        <div class="col-6 col-md-3">
+                            <div class="text-muted small">Cache Hit Rate</div>
+                            <div class="fw-bold text-success" x-text="scanCacheHitRate + '%'"></div>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <div class="text-muted small">Cache Hits</div>
+                            <div class="fw-bold" x-text="scan.cache_hits || 0"></div>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <div class="text-muted small">API Calls</div>
+                            <div class="fw-bold" x-text="scan.api_calls || 0"></div>
+                        </div>
+                        <div class="col-6 col-md-3">
+                            <div class="text-muted small">Avg Response</div>
+                            <div class="fw-bold" x-text="(scan.avg_response_time || 0).toFixed(2) + 's'"></div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Filter & Sort bar -->
                 <div class="filter-bar d-flex gap-2 mb-3 flex-wrap align-items-center">
                     <input type="text" class="form-control form-control-sm" style="max-width: 250px;"
@@ -456,6 +478,14 @@
 
             get scanTotalCandidates() {
                 return this.scan.results.reduce((sum, s) => sum + s.candidates.length, 0);
+            },
+
+            get scanCacheHitRate() {
+                const hits = this.scan.cache_hits || 0;
+                const misses = this.scan.cache_misses || 0;
+                const total = hits + misses;
+                if (total === 0) return 0;
+                return Math.round((hits / total) * 100);
             },
 
             get scanEta() {
